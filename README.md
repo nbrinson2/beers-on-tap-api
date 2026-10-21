@@ -10,8 +10,8 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Set DATABASE_URL (Postgres + PostGIS required)
-export DATABASE_URL="postgresql://user:pass@localhost:5432/beers"
+# Local config (Postgres + PostGIS required). .env is not committed.
+cp .env.example .env
 
 # Run schema
 psql $DATABASE_URL -f schema.sql

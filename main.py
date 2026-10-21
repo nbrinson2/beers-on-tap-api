@@ -5,8 +5,11 @@ from datetime import datetime
 import os
 import asyncpg
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/beers")
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5433/beers")
 
 app = FastAPI(title="Beers on Tap API", version="0.2.0", description="Charlotte-first beers on tap database API")
 
