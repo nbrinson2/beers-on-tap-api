@@ -33,7 +33,8 @@ CREATE TABLE beers (
     normalized_name TEXT,
     external_ids JSONB DEFAULT '{}',
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (name, brewery)
 );
 
 CREATE INDEX idx_beers_normalized ON beers (normalized_name);

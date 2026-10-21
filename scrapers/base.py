@@ -14,6 +14,7 @@ class TapListing:
         brewery: Optional[str] = None,
         style: Optional[str] = None,
         abv: Optional[float] = None,
+        ibu: Optional[int] = None,
         serving_type: Optional[str] = None,
         price: Optional[float] = None,
         size: Optional[str] = None,
@@ -23,6 +24,7 @@ class TapListing:
         self.brewery = brewery
         self.style = style
         self.abv = abv
+        self.ibu = ibu
         self.serving_type = serving_type
         self.price = price
         self.size = size

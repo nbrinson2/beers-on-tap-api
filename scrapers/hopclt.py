@@ -1,7 +1,7 @@
 """
 HopCLT scraper.
 Parses brewery pages like https://hopclt.com/brewery/olde_mecklenburg
-Returns beers that show an ABV (current taps).
+Reads style, ABV, and IBU from the On Tap Now section only.
 """
 import re
 import httpx
@@ -19,60 +19,59 @@ class HopCLTScraper(BaseScraper):
             resp.raise_for_status()
             return resp.text
 
-    def parse(self, content: str, venue_name: str) -> List[TapListing]:
-        soup = BeautifulSoup(content, "html.parser")
-        listings: List[TapListing] = []
+    def _on_tap_soup(self, soup: BeautifulSoup) -> BeautifulSoup:
+        """Keep only the On Tap Now section, before the next page heading."""
+        heading = next(
+            (h2 for h2 in soup.find_all("h2") if "On Tap Now" in h2.get_text()),
+            None,
+        )
+        if heading is None:
+            return BeautifulSoup("", "html.parser")
 
-        for a in soup.find_all("a", href=re.compile(r"^/beer/")):
-            beer_name = a.get_text(strip=True)
+        parts = []
+        for sibling in heading.next_siblings:
+            if getattr(sibling, "name", None) == "h2":
+                break
+            parts.append(str(sibling))
+        return BeautifulSoup("".join(parts), "html.parser")
+
+    def parse(self, content: str, venue_name: str) -> List[TapListing]:
+        soup = self._on_tap_soup(BeautifulSoup(content, "html.parser"))
+        listings: List[TapListing] = []
+        seen_hrefs = set()
+
+        for card in soup.find_all("div"):
+            style_attr = (card.get("style") or "").replace(" ", "")
+            if "grid-template-columns:60px" not in style_attr:
+                continue
+
+            link = card.find("a", href=re.compile(r"^/beer/"))
+            if link is None:
+                continue
+            href = link["href"]
+            if href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+
+            beer_name = link.get_text(strip=True)
             if not beer_name or len(beer_name) < 2:
                 continue
 
-            # Climb to a container that includes the ABV
-            card = a
-            for _ in range(8):
-                card = card.parent
-                if card is None or card.name == "body":
-                    break
-                if "%" in card.get_text():
-                    break
-
-            if card is None:
-                continue
+            style_span = card.find("span")
+            style = style_span.get_text(strip=True) if style_span else None
+            if style == "Unknown":
+                style = None
 
             text = card.get_text(" ", strip=True)
-
-            # Only keep cards that actually show an ABV percentage (current taps)
-            if "%" not in text:
-                continue
-
-            style = None
-            style_match = re.search(
-                r"(?:IPA|Pilsner|Altbier|Lager|Porter|Stout|Hefeweizen|Pale Ale|Sour|Saison|Bock|Wit|Weisse|Kellerbier|Helles|Dunkel|Schwarzbier|Red|Wheat|Seltzer|Cider)",
-                text,
-                re.IGNORECASE,
-            )
-            if style_match:
-                style = style_match.group(0)
-
             abv = None
             abv_match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
             if abv_match:
-                try:
-                    abv = float(abv_match.group(1))
-                except ValueError:
-                    pass
+                abv = float(abv_match.group(1))
 
             ibu = None
             ibu_match = re.search(r"(\d+)\s*IBU", text, re.IGNORECASE)
             if ibu_match:
-                try:
-                    ibu = int(ibu_match.group(1))
-                except ValueError:
-                    pass
-
-            if any(l.beer_name == beer_name for l in listings):
-                continue
+                ibu = int(ibu_match.group(1))
 
             listings.append(
                 TapListing(
@@ -80,12 +79,9 @@ class HopCLTScraper(BaseScraper):
                     brewery=venue_name,
                     style=style,
                     abv=abv,
-                    raw={"ibu": ibu, "source": "hopclt"},
+                    ibu=ibu,
+                    raw={"source": "hopclt", "hopclt": href},
                 )
             )
-
-            # Safety: current tap lists are rarely > 40 beers
-            if len(listings) >= 40:
-                break
 
         return listings
