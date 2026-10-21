@@ -1,6 +1,7 @@
 """
 HopCLT scraper.
 Parses brewery pages like https://hopclt.com/brewery/olde_mecklenburg
+Only returns beers currently listed under "On Tap Now".
 """
 import re
 import httpx
@@ -22,19 +23,26 @@ class HopCLTScraper(BaseScraper):
         soup = BeautifulSoup(content, "html.parser")
         listings: List[TapListing] = []
 
-        # Each beer name is an <a href="/beer/..."> inside an <h3>
-        for a in soup.find_all("a", href=re.compile(r"^/beer/")):
+        # Restrict to the "On Tap Now" section
+        on_tap_header = soup.find(string=re.compile(r"On Tap Now", re.IGNORECASE))
+        search_root = soup
+        if on_tap_header:
+            # Climb to a container that holds the current taps
+            parent = on_tap_header.find_parent(["div", "section", "article"])
+            if parent:
+                search_root = parent
+
+        for a in search_root.find_all("a", href=re.compile(r"^/beer/")):
             beer_name = a.get_text(strip=True)
             if not beer_name or len(beer_name) < 2:
                 continue
 
-            # Climb to a reasonably large container that holds the beer row
+            # Climb to a container that includes the ABV
             card = a
-            for _ in range(6):
+            for _ in range(8):
                 card = card.parent
                 if card is None or card.name == "body":
                     break
-                # Stop once we have a container with both the name and a % sign
                 if "%" in card.get_text():
                     break
 
@@ -44,8 +52,6 @@ class HopCLTScraper(BaseScraper):
             text = card.get_text(" ", strip=True)
 
             style = None
-            # Style tends to appear as a short token after the name and before ABV
-            # Look for common style words or the first non-numeric span-like text
             style_match = re.search(
                 r"(?:IPA|Pilsner|Altbier|Lager|Porter|Stout|Hefeweizen|Pale Ale|Sour|Saison|Bock|Wit|Weisse|Kellerbier|Helles|Dunkel|Schwarzbier|Red|Wheat|Seltzer|Cider)",
                 text,
@@ -70,7 +76,6 @@ class HopCLTScraper(BaseScraper):
                 except ValueError:
                     pass
 
-            # Deduplicate by name within this page (multi-location pages repeat beers)
             if any(l.beer_name == beer_name for l in listings):
                 continue
 
