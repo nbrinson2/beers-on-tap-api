@@ -18,6 +18,29 @@ def normalize_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
 
 
+_ADDRESS_WORDS = {
+    "avenue": "ave",
+    "street": "st",
+    "road": "rd",
+    "drive": "dr",
+    "boulevard": "blvd",
+    "lane": "ln",
+    "court": "ct",
+    "place": "pl",
+    "parkway": "pkwy",
+    "highway": "hwy",
+    "north": "n",
+    "south": "s",
+    "east": "e",
+    "west": "w",
+}
+
+
+def normalize_address(value: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+    return " ".join(_ADDRESS_WORDS.get(part, part) for part in text.split())
+
+
 async def upsert_beer(conn, listing) -> str:
     """Find or create a beer. Returns beer_id."""
     external_ids = {}
@@ -48,12 +71,16 @@ async def upsert_beer(conn, listing) -> str:
 
 
 async def upsert_tap(conn, venue_id: str, beer_id: str, listing):
+    price = (listing.raw or {}).get("price")
+    if not isinstance(price, (int, float)):
+        price = None
     await conn.execute(
         """
-        INSERT INTO tap_listings (venue_id, beer_id, status, source, confidence, last_seen, last_updated)
-        VALUES ($1::uuid, $2::uuid, 'on_tap', $3, 0.8, NOW(), NOW())
+        INSERT INTO tap_listings (venue_id, beer_id, status, price, source, confidence, last_seen, last_updated)
+        VALUES ($1::uuid, $2::uuid, 'on_tap', $3, $4, 0.8, NOW(), NOW())
         ON CONFLICT (venue_id, beer_id) DO UPDATE
         SET status = 'on_tap',
+            price = EXCLUDED.price,
             source = EXCLUDED.source,
             confidence = EXCLUDED.confidence,
             last_seen = NOW(),
@@ -61,8 +88,109 @@ async def upsert_tap(conn, venue_id: str, beer_id: str, listing):
         """,
         venue_id,
         beer_id,
+        price,
         listing.raw.get("source", "hopclt") if listing.raw else "hopclt",
     )
+
+
+def source_tags(sources) -> list:
+    if not sources:
+        return []
+    if isinstance(sources, str):
+        sources = json.loads(sources)
+    return sources if isinstance(sources, list) else []
+
+
+def location_label(brewery_name: str, location) -> str:
+    name = (location.name or "").strip()
+    if not name or name.lower() == brewery_name.lower():
+        if location.address:
+            return f"{brewery_name} - {location.address}"
+        return brewery_name
+    return f"{brewery_name} - {name}"
+
+
+def find_venue_for_location(candidates, location, only_location: bool):
+    """Reuse a same-brewery venue already tied to this location or address."""
+    tag = f"hopclt:{location.location_id}"
+    for venue in candidates:
+        if tag in source_tags(venue["sources"]):
+            return venue
+
+    address = normalize_address(location.address)
+    if address:
+        matches = [
+            venue for venue in candidates
+            if normalize_address(venue["address"]) == address
+        ]
+        if matches:
+            return matches[0]
+
+    if only_location and len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+async def save_venue(conn, venues, venue, brewery_name, location):
+    """Update a matched venue, or insert one, and return its id and name."""
+    tag = json.dumps([f"hopclt:{location.location_id}"])
+    lat = float(location.lat) if location.lat is not None else None
+    lng = float(location.lng) if location.lng is not None else None
+    if venue:
+        row = await conn.fetchrow(
+            """
+            UPDATE venues
+            SET address = COALESCE(NULLIF($2, ''), address),
+                city = COALESCE(NULLIF($3, ''), city),
+                neighborhood = COALESCE(NULLIF($4, ''), neighborhood),
+                location = CASE
+                    WHEN $5::float8 IS NOT NULL AND $6::float8 IS NOT NULL
+                    THEN ST_SetSRID(ST_MakePoint($6, $5), 4326)::geography
+                    ELSE location
+                END,
+                sources = CASE
+                    WHEN sources @> $7::jsonb THEN sources
+                    ELSE COALESCE(sources, '[]'::jsonb) || $7::jsonb
+                END,
+                updated_at = NOW()
+            WHERE id = $1::uuid
+            RETURNING id::text, name, address, city, sources
+            """,
+            venue["id"],
+            location.address,
+            location.city,
+            location.neighborhood,
+            lat,
+            lng,
+            tag,
+        )
+        return row
+
+    name = location_label(brewery_name, location)
+    row = await conn.fetchrow(
+        """
+        INSERT INTO venues (name, address, city, state, neighborhood, location, sources)
+        VALUES (
+            $1, NULLIF($2, ''), NULLIF($3, ''), 'North Carolina', NULLIF($4, ''),
+            CASE
+                WHEN $5::float8 IS NOT NULL AND $6::float8 IS NOT NULL
+                THEN ST_SetSRID(ST_MakePoint($6, $5), 4326)::geography
+                ELSE NULL
+            END,
+            $7::jsonb
+        )
+        RETURNING id::text, name, address, city, sources
+        """,
+        name,
+        location.address,
+        location.city,
+        location.neighborhood,
+        lat,
+        lng,
+        tag,
+    )
+    venues.append(row)
+    return row
 
 
 # Full HopCLT brewery list. Names are matched with ILIKE.
@@ -149,52 +277,94 @@ async def run_scrapers():
     hopclt = HopCLTScraper()
 
     async with pool.acquire() as conn:
+        venues = await conn.fetch(
+            "SELECT id::text, name, address, city, sources FROM venues ORDER BY name"
+        )
+        venues = list(venues)
+
         for venue_name, hopclt_url in MAPPINGS:
-            venue = await conn.fetchrow(
-                "SELECT id::text, name FROM venues WHERE name ILIKE $1 LIMIT 1",
-                f"%{venue_name}%",
-            )
-            if not venue:
-                print(f"Venue not found: {venue_name}")
+            candidates = [
+                venue for venue in venues
+                if re.search(r"(?<![a-z])" + re.escape(venue_name.lower()), venue["name"].lower())
+            ]
+            print(f"Scraping {venue_name} ...")
+            try:
+                content = await hopclt.fetch(hopclt_url, venue_name)
+                locations = hopclt.parse_locations(content, venue_name)
+            except Exception as e:
+                print(f"  Error: {e}")
                 continue
 
-            venue_id = venue["id"]
-            print(f"Scraping {venue['name']} ...")
+            if not locations:
+                print("  No locations found; left existing taps unchanged")
+                continue
 
-            try:
-                listings = await hopclt.scrape(hopclt_url, venue["name"])
-                print(f"  Found {len(listings)} current taps")
-                if not listings:
-                    print("  No on-tap beers found; left existing taps unchanged")
-                    continue
+            brewery_name = venue_name
+            for location in locations:
+                if location.listings:
+                    brewery_name = location.listings[0].brewery
+                    break
+
+            used_ids = set()
+            only_location = len(locations) == 1
+            print(f"  {len(locations)} locations")
+
+            for location in locations:
+                venue = find_venue_for_location(candidates, location, only_location)
+                if venue and venue["id"] in used_ids:
+                    venue = None
+                saved = await save_venue(conn, venues, venue, brewery_name, location)
+                for index, existing in enumerate(venues):
+                    if existing["id"] == saved["id"]:
+                        venues[index] = saved
+                        break
+                used_ids.add(saved["id"])
 
                 beer_ids = []
-                for listing in listings:
+                for listing in location.listings:
                     beer_id = await upsert_beer(conn, listing)
-                    await upsert_tap(conn, venue_id, beer_id, listing)
+                    await upsert_tap(conn, saved["id"], beer_id, listing)
                     beer_ids.append(beer_id)
+                if beer_ids:
+                    await conn.execute(
+                        """
+                        DELETE FROM tap_listings
+                        WHERE venue_id = $1::uuid
+                          AND NOT (beer_id = ANY($2::uuid[]))
+                        """,
+                        saved["id"],
+                        beer_ids,
+                    )
+                else:
+                    await conn.execute(
+                        """
+                        DELETE FROM tap_listings
+                        WHERE venue_id = $1::uuid AND source = 'hopclt'
+                        """,
+                        saved["id"],
+                    )
+                label = location.name or location.address or saved["name"]
+                print(f"  {saved['name']}: {len(location.listings)} taps ({label})")
 
+            for venue in candidates:
+                if venue["id"] in used_ids:
+                    continue
                 await conn.execute(
                     """
                     DELETE FROM tap_listings
-                    WHERE venue_id = $1::uuid
-                      AND NOT (beer_id = ANY($2::uuid[]))
+                    WHERE venue_id = $1::uuid AND source = 'hopclt'
                     """,
-                    venue_id,
-                    beer_ids,
-                )
-                await conn.execute(
-                    """
-                    DELETE FROM beers
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM tap_listings tl WHERE tl.beer_id = beers.id
-                    )
-                    """
+                    venue["id"],
                 )
 
-                print(f"  Upserted {len(listings)} taps")
-            except Exception as e:
-                print(f"  Error: {e}")
+            await conn.execute(
+                """
+                DELETE FROM beers
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM tap_listings tl WHERE tl.beer_id = beers.id
+                )
+                """
+            )
 
     await pool.close()
 

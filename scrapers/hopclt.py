@@ -1,13 +1,27 @@
 """
 HopCLT scraper.
-Parses brewery pages like https://hopclt.com/brewery/olde_mecklenburg
-Reads style, ABV, and IBU from the On Tap Now section only.
+Parses brewery pages like https://hopclt.com/brewery/olde_mecklenburg.
+Uses the page data for beers marked on tap, one list per location.
 """
-import re
+import json
 import httpx
 from typing import List
 from bs4 import BeautifulSoup
 from .base import BaseScraper, TapListing
+
+
+class LocationTaps:
+    """One HopCLT taproom and the beers currently on tap there."""
+
+    def __init__(self, location_id, name, address, city, neighborhood, lat, lng, listings):
+        self.location_id = location_id
+        self.name = name or ""
+        self.address = address or ""
+        self.city = city or ""
+        self.neighborhood = neighborhood or ""
+        self.lat = lat
+        self.lng = lng
+        self.listings = listings
 
 
 class HopCLTScraper(BaseScraper):
@@ -19,69 +33,93 @@ class HopCLTScraper(BaseScraper):
             resp.raise_for_status()
             return resp.text
 
-    def _on_tap_soup(self, soup: BeautifulSoup) -> BeautifulSoup:
-        """Keep only the On Tap Now section, before the next page heading."""
-        heading = next(
-            (h2 for h2 in soup.find_all("h2") if "On Tap Now" in h2.get_text()),
-            None,
-        )
-        if heading is None:
-            return BeautifulSoup("", "html.parser")
+    def _page_props(self, content: str):
+        soup = BeautifulSoup(content, "html.parser")
+        script = soup.find("script", id="__NEXT_DATA__")
+        if script is None or not script.string:
+            return None
+        return json.loads(script.string)["props"]["pageProps"]
 
-        parts = []
-        for sibling in heading.next_siblings:
-            if getattr(sibling, "name", None) == "h2":
-                break
-            parts.append(str(sibling))
-        return BeautifulSoup("".join(parts), "html.parser")
+    def parse_locations(self, content: str, venue_name: str) -> List[LocationTaps]:
+        props = self._page_props(content)
+        if not props:
+            return []
 
-    def parse(self, content: str, venue_name: str) -> List[TapListing]:
-        soup = self._on_tap_soup(BeautifulSoup(content, "html.parser"))
-        listings: List[TapListing] = []
-        seen_hrefs = set()
+        brewery_name = (props.get("brewery") or {}).get("name") or venue_name
+        locations = list(props.get("breweryLocations") or [])
+        by_id = {loc["id"]: loc for loc in locations}
+        listings_by_location = {loc["id"]: [] for loc in locations}
+        seen = set()
 
-        for card in soup.find_all("div"):
-            style_attr = (card.get("style") or "").replace(" ", "")
-            if "grid-template-columns:60px" not in style_attr:
+        for beer in props.get("breweryBeers") or []:
+            if not beer.get("on_tap"):
+                continue
+            if beer.get("first_seen_status") == "rejected":
+                continue
+            name = (beer.get("name") or "").strip()
+            if len(name) < 2:
                 continue
 
-            link = card.find("a", href=re.compile(r"^/beer/"))
-            if link is None:
+            location_id = beer.get("location_id")
+            key = (beer.get("id") or name, location_id)
+            if key in seen:
                 continue
-            href = link["href"]
-            if href in seen_hrefs:
-                continue
-            seen_hrefs.add(href)
+            seen.add(key)
 
-            beer_name = link.get_text(strip=True)
-            if not beer_name or len(beer_name) < 2:
-                continue
-
-            style_span = card.find("span")
-            style = style_span.get_text(strip=True) if style_span else None
+            style = beer.get("style_original") or beer.get("style")
             if style == "Unknown":
                 style = None
-
-            text = card.get_text(" ", strip=True)
-            abv = None
-            abv_match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
-            if abv_match:
-                abv = float(abv_match.group(1))
-
-            ibu = None
-            ibu_match = re.search(r"(\d+)\s*IBU", text, re.IGNORECASE)
-            if ibu_match:
-                ibu = int(ibu_match.group(1))
-
-            listings.append(
-                TapListing(
-                    beer_name=beer_name,
-                    brewery=venue_name,
-                    style=style,
-                    abv=abv,
-                    ibu=ibu,
-                    raw={"source": "hopclt", "hopclt": href},
-                )
+            abv = beer.get("abv")
+            ibu = beer.get("ibu")
+            loc = by_id.get(location_id) or {}
+            listing = TapListing(
+                beer_name=name,
+                brewery=brewery_name,
+                style=style,
+                abv=float(abv) if abv is not None else None,
+                ibu=int(ibu) if isinstance(ibu, (int, float)) else None,
+                raw={
+                    "source": "hopclt",
+                    "hopclt": beer.get("beerSlug") or beer.get("id"),
+                    "location_id": location_id,
+                    "location_name": loc.get("name") or "",
+                    "address": loc.get("address") or "",
+                    "city": loc.get("city") or "",
+                    "price": beer.get("price"),
+                },
             )
+            listings_by_location.setdefault(location_id, []).append(listing)
 
+        parsed = []
+        for loc in locations:
+            parsed.append(LocationTaps(
+                location_id=loc.get("id"),
+                name=loc.get("name") or "",
+                address=loc.get("address") or "",
+                city=loc.get("city") or "",
+                neighborhood=loc.get("neighborhood") or "",
+                lat=loc.get("lat"),
+                lng=loc.get("lng"),
+                listings=listings_by_location.get(loc.get("id"), []),
+            ))
+        for location_id, listings in listings_by_location.items():
+            if location_id in by_id or not listings:
+                continue
+            sample = listings[0].raw
+            parsed.append(LocationTaps(
+                location_id=location_id,
+                name=sample.get("location_name") or "",
+                address=sample.get("address") or "",
+                city=sample.get("city") or "",
+                neighborhood="",
+                lat=None,
+                lng=None,
+                listings=listings,
+            ))
+        return parsed
+
+    def parse(self, content: str, venue_name: str) -> List[TapListing]:
+        listings = []
+        for location in self.parse_locations(content, venue_name):
+            listings.extend(location.listings)
         return listings
