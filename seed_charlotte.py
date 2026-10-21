@@ -4,6 +4,7 @@ Run after schema is applied.
 """
 import asyncio
 import os
+import json
 import asyncpg
 import httpx
 
@@ -28,7 +29,7 @@ async def seed():
                     continue
                 await conn.execute("""
                     INSERT INTO venues (name, address, city, state, country, location, website, sources)
-                    VALUES ($1, $2, $3, $4, $5, ST_MakePoint($6, $7)::geography, $8, $9)
+                    VALUES ($1, $2, $3, $4, $5, ST_MakePoint($6, $7)::geography, $8, $9::jsonb)
                     ON CONFLICT DO NOTHING
                 """,
                     b.get("name"),
@@ -38,7 +39,7 @@ async def seed():
                     b.get("country"),
                     float(lon), float(lat),
                     b.get("website_url"),
-                    ["openbrewerydb"]
+                    json.dumps(["openbrewerydb"])
                 )
         print("Seeding complete.")
     await pool.close()
