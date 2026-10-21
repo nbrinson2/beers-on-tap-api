@@ -22,35 +22,39 @@ class HopCLTScraper(BaseScraper):
         soup = BeautifulSoup(content, "html.parser")
         listings: List[TapListing] = []
 
-        # Beer rows live inside grid containers under "On Tap Now"
-        # Each beer is in a div that contains an <h3><a> with the name
-        for h3 in soup.find_all("h3"):
-            a = h3.find("a", href=re.compile(r"^/beer/"))
-            if not a:
-                continue
+        # Each beer name is an <a href="/beer/..."> inside an <h3>
+        for a in soup.find_all("a", href=re.compile(r"^/beer/")):
             beer_name = a.get_text(strip=True)
-            if not beer_name:
+            if not beer_name or len(beer_name) < 2:
                 continue
 
-            # Walk up to the containing beer card
-            card = h3.find_parent("div")
-            if not card:
-                continue
-
-            style = None
-            abv = None
-            ibu = None
-
-            # Style is usually the first span after the name in the same card
-            for span in card.find_all("span"):
-                text = span.get_text(strip=True)
-                if text and not text.endswith("%") and "ABV" not in text and "IBU" not in text:
-                    if not style:
-                        style = text
+            # Climb to a reasonably large container that holds the beer row
+            card = a
+            for _ in range(6):
+                card = card.parent
+                if card is None or card.name == "body":
+                    break
+                # Stop once we have a container with both the name and a % sign
+                if "%" in card.get_text():
                     break
 
-            # ABV appears as e.g. "6.8%" near the word ABV
+            if card is None:
+                continue
+
             text = card.get_text(" ", strip=True)
+
+            style = None
+            # Style tends to appear as a short token after the name and before ABV
+            # Look for common style words or the first non-numeric span-like text
+            style_match = re.search(
+                r"(?:IPA|Pilsner|Altbier|Lager|Porter|Stout|Hefeweizen|Pale Ale|Sour|Saison|Bock|Wit|Weisse|Kellerbier|Helles|Dunkel|Schwarzbier|Red|Wheat|Seltzer|Cider)",
+                text,
+                re.IGNORECASE,
+            )
+            if style_match:
+                style = style_match.group(0)
+
+            abv = None
             abv_match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
             if abv_match:
                 try:
@@ -58,12 +62,17 @@ class HopCLTScraper(BaseScraper):
                 except ValueError:
                     pass
 
+            ibu = None
             ibu_match = re.search(r"(\d+)\s*IBU", text, re.IGNORECASE)
             if ibu_match:
                 try:
                     ibu = int(ibu_match.group(1))
                 except ValueError:
                     pass
+
+            # Deduplicate by name within this page (multi-location pages repeat beers)
+            if any(l.beer_name == beer_name for l in listings):
+                continue
 
             listings.append(
                 TapListing(
