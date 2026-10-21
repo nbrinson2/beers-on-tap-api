@@ -1,7 +1,7 @@
 """
 HopCLT scraper.
 Parses brewery pages like https://hopclt.com/brewery/olde_mecklenburg
-Returns beers that appear before the "Previously On Tap" section.
+Returns beers that show an ABV (current taps).
 """
 import re
 import httpx
@@ -23,20 +23,7 @@ class HopCLTScraper(BaseScraper):
         soup = BeautifulSoup(content, "html.parser")
         listings: List[TapListing] = []
 
-        # Collect beer links that appear before the "Previously On Tap" section
-        previously_header = soup.find(string=re.compile(r"Previously On Tap", re.IGNORECASE))
-
         for a in soup.find_all("a", href=re.compile(r"^/beer/")):
-            # Stop once we pass the previously-on-tap header
-            if previously_header and a.sourcepos and previously_header.sourcepos:
-                if a.sourcepos > previously_header.sourcepos:
-                    break
-            # Fallback: if sourcepos isn't available, check document order via parents
-            if previously_header:
-                # Simple heuristic: if this link's parent chain comes after the header in the tree
-                # We'll just collect and filter later if needed
-                pass
-
             beer_name = a.get_text(strip=True)
             if not beer_name or len(beer_name) < 2:
                 continue
@@ -55,8 +42,7 @@ class HopCLTScraper(BaseScraper):
 
             text = card.get_text(" ", strip=True)
 
-            # Skip if this card is clearly in the previously section (no ABV and long name history)
-            # Prefer beers that actually show an ABV percentage
+            # Only keep cards that actually show an ABV percentage (current taps)
             if "%" not in text:
                 continue
 
