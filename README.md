@@ -17,10 +17,10 @@ cp .env.example .env
 psql $DATABASE_URL -f schema.sql
 
 # Start API
-uvicorn main:app --reload
+uvicorn main:app --reload --port 8005
 ```
 
-Docs at http://localhost:8000/docs
+Docs at http://localhost:8005/docs
 
 ## Endpoints (starter)
 
