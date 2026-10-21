@@ -65,21 +65,48 @@ async def upsert_tap(conn, venue_id: str, beer_id: str, listing):
     )
 
 
+# Venue name (substring match) -> HopCLT brewery page
+# Names are matched with ILIKE so they don't have to be exact.
+MAPPINGS = [
+    ("Olde Mecklenburg", "https://hopclt.com/brewery/olde_mecklenburg"),
+    ("Resident Culture", "https://hopclt.com/brewery/resident_culture"),
+    ("HopFly", "https://hopclt.com/brewery/hopfly"),
+    ("Birdsong", "https://hopclt.com/brewery/birdsong"),
+    ("Petty Thieves", "https://hopclt.com/brewery/petty_thieves"),
+    ("Fonta Flora", "https://hopclt.com/brewery/fonta_flora"),
+    ("Wooden Robot", "https://hopclt.com/brewery/wooden_robot"),
+    ("Town Brewing", "https://hopclt.com/brewery/town"),
+    ("Free Range", "https://hopclt.com/brewery/free_range"),
+    ("Heist", "https://hopclt.com/brewery/heist"),
+    ("Pilot Brewing", "https://hopclt.com/brewery/pilot"),
+    ("Club West", "https://hopclt.com/brewery/club_west_brewing"),
+    ("Legion", "https://hopclt.com/brewery/legion"),
+    ("Hi-Wire", "https://hopclt.com/brewery/hiwire"),
+    ("Monday Night", "https://hopclt.com/brewery/monday_night"),
+    ("Burial", "https://hopclt.com/brewery/burial"),
+    ("NoDa Brewing", "https://hopclt.com/brewery/noda_brewing"),
+    ("Triple C", "https://hopclt.com/brewery/triple_c"),
+    ("Suffolk Punch", "https://hopclt.com/brewery/suffolk_punch"),
+    ("Lenny Boy", "https://hopclt.com/brewery/lenny_boy"),
+    ("Salud", "https://hopclt.com/brewery/salud"),
+    ("Divine Barrel", "https://hopclt.com/brewery/divine_barrel"),
+    ("Sugar Creek", "https://hopclt.com/brewery/sugar_creek"),
+    ("Edge City", "https://hopclt.com/brewery/edge_city"),
+    ("Armored Cow", "https://hopclt.com/brewery/armored_cow"),
+    ("Seaboard", "https://hopclt.com/brewery/seaboard"),
+    ("Traust", "https://hopclt.com/brewery/traust"),
+    ("Primal", "https://hopclt.com/brewery/primal"),
+]
+
+
 async def run_scrapers():
     pool = await asyncpg.create_pool(DATABASE_URL)
     hopclt = HopCLTScraper()
 
-    # For now we hard-code one mapping. Expand this into a table or config later.
-    # Format: (venue_name_in_db, hopclt_url)
-    mappings = [
-        ("The Olde Mecklenburg Brewery", "https://hopclt.com/brewery/olde_mecklenburg"),
-        # Add more as you map them
-    ]
-
     async with pool.acquire() as conn:
-        for venue_name, hopclt_url in mappings:
+        for venue_name, hopclt_url in MAPPINGS:
             venue = await conn.fetchrow(
-                "SELECT id::text FROM venues WHERE name ILIKE $1 LIMIT 1",
+                "SELECT id::text, name FROM venues WHERE name ILIKE $1 LIMIT 1",
                 f"%{venue_name}%",
             )
             if not venue:
@@ -87,10 +114,10 @@ async def run_scrapers():
                 continue
 
             venue_id = venue["id"]
-            print(f"Scraping {venue_name} ...")
+            print(f"Scraping {venue['name']} ...")
 
             try:
-                listings = await hopclt.scrape(hopclt_url, venue_name)
+                listings = await hopclt.scrape(hopclt_url, venue["name"])
                 print(f"  Found {len(listings)} current taps")
                 if not listings:
                     print("  No on-tap beers found; left existing taps unchanged")
